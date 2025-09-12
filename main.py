@@ -11,12 +11,10 @@ uvicron main:app
 
 
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, Form, Query
+from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from datetime import datetime, timedelta, timezone
-import time
-import threading
+from datetime import datetime
 import numpy as np
 import cv2
 import os
@@ -26,6 +24,11 @@ from insightface.app import FaceAnalysis
 
 # Konfigurasi aplikasi
 known_faces_folder = "known_faces"
+
+if not os.path.exists(os.path.join(os.getcwd(), known_faces_folder)):
+    raise HTTPException(status_code=400, detail=f"Folder {known_faces_folder} untuk menyimpan kumpulan wajah tidak ditemukan.")
+
+
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
@@ -37,7 +40,7 @@ face_analyzer.prepare(ctx_id=ctx_id) # 0 = GPU slot pertama, -1 = CPU
 
 
 
-# Menyimpan embedding muka (file .jpg atau .png) dari known_faces_folder
+# Menyimpan embedding muka (hanya file .jpg) dari known_faces_folder
 # Jika ada nama file yang sama, maka file yang selanjutnya akan menimpa yang awal
 known_faces = {}
 
@@ -45,7 +48,7 @@ def load_known_faces():
     known_files = [f for f in os.listdir(known_faces_folder) if os.path.isfile(os.path.join(known_faces_folder, f))]
 
     for file in known_files:
-        if file.lower().endswith((".jpg", ".png")):
+        if file.lower().endswith((".jpg")):
             username = os.path.splitext(file)[0]
             image = cv2.imread(os.path.join(known_faces_folder, file))
             faces = face_analyzer.get(image)
@@ -72,7 +75,18 @@ Petunjuk penggunaan Postman:
 '''
 @app.post("/api/recognize")
 async def recognize_face(file: UploadFile = File(...)):
+    # Cek ekstensi file
+    file_extension = os.path.splitext(file.filename)[-1].lower()
+
+    if file_extension != '.jpg':
+        raise HTTPException(status_code=400, detail="Hanya menerima ekstensi file .jpg")
+
+    # Cek isi file yang diunggah
     input_data = await file.read()
+
+    if not input_data:
+        raise HTTPException(status_code=400, detail="File yang diunggah tidak berisi.")
+
     np_data = np.frombuffer(input_data, np.uint8)
     input_img = cv2.imdecode(np_data, cv2.IMREAD_COLOR)
     input_faces = face_analyzer.get(input_img) # bbox, kps, det_score, landmark_3d_68, pose, landmark_2d_106, gender, age, embedding
@@ -80,6 +94,7 @@ async def recognize_face(file: UploadFile = File(...)):
     if not input_faces:
         raise HTTPException(status_code=400, detail="Tidak ada wajah yang terdeteksi (liveness model).")
     
+    # Mencocokkan muka yang ingin dikenali dengan kumpulan wajah yang telah dikenali
     input_embedding = input_faces[0].embedding.reshape(1, -1)
     best_match_username = None
     best_score = -1
@@ -117,25 +132,33 @@ Petunjuk penggunaan Postman:
 '''
 @app.post("/api/upload_face")
 async def upload_face(file: UploadFile = File(...)):
-    # Cek apakah username sudah dipakai sebagai nama file di dalam known_faces_folder
-    new_username = file.filename.split('.')[0]
-    known_filenames = [f.split('.')[0] for f in os.listdir(known_faces_folder) if os.path.isfile(os.path.join(known_faces_folder, f))]
+    # Cek ekstensi file
+    file_extension = os.path.splitext(file.filename)[-1].lower()
 
-    if new_username in known_filenames:
-        raise HTTPException(status_code=404, detail="Username sudah dipakai.")
+    if file_extension != '.jpg':
+        raise HTTPException(status_code=400, detail="Hanya menerima ekstensi file .jpg")
+
+    # Cek isi file yang diunggah
+    new_file = await file.read()
+
+    if not new_file:
+        raise HTTPException(status_code=400, detail="File yang diunggah tidak berisi.")
 
     # Simpan foto baru dengan nama file berupa username dan formatnya .jpg
-    filename = f"{new_username}.jpg"
+    new_username = file.filename.split('.')[0]
+    filename = f"{new_username}{file_extension}"
     file_path = os.path.join(known_faces_folder, filename)
 
     with open(file_path, "wb") as f:
-        f.write(await file.read())
+        f.write(new_file)
 
     # Mengekstrak face embedding untuk foto baru dan menambahkannya ke dalam daftar wajah yang sudah dikenali (objek known_faces)
-    new_image = cv2.imread(file_path)
+    new_image = cv2.imdecode(np.frombuffer(new_file, np.uint8), cv2.IMREAD_COLOR)
     faces = face_analyzer.get(new_image)
 
     if faces:
         known_faces[new_username] = faces[0].embedding
+    else:
+        raise HTTPException(status_code=400, detail="Tidak ada muka yang terdeteksi.")
 
     return JSONResponse({"status": "success", "message": f"Wajah {new_username} berhasil disimpan dan dikenali."})
